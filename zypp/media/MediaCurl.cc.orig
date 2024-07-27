@@ -21,6 +21,7 @@
 #include "zypp/base/Gettext.h"
 
 #include "zypp/media/MediaCurl.h"
+#include "zypp/media/proxyinfo/ProxyInfos.h"
 #include "zypp/media/ProxyInfo.h"
 #include "zypp/media/MediaUserAuth.h"
 #include "zypp/media/CredentialManager.h"
@@ -42,8 +43,6 @@
 #define  CONNECT_TIMEOUT        60
 #define  TRANSFER_TIMEOUT       60 * 3
 #define  TRANSFER_TIMEOUT_MAX   60 * 60
-
-#define EXPLICITLY_NO_PROXY "_none_"
 
 #undef CURLVERSION_AT_LEAST
 #define CURLVERSION_AT_LEAST(M,N,O) LIBCURL_VERSION_NUM >= ((((M)<<8)+(N))<<8)+(O)
@@ -276,62 +275,50 @@ void fillSettingsFromUrl( const Url &url, TransferSettings &s )
         }
     }
 
-    Pathname ca_path( url.getQueryParam("ssl_capath") );
+    Pathname ca_path = Pathname(url.getQueryParam("ssl_capath")).asString();
     if( ! ca_path.empty())
     {
-        if( !PathInfo(ca_path).isDir() || ! ca_path.absolute())
+        if( !PathInfo(ca_path).isDir() || !Pathname(ca_path).absolute())
             ZYPP_THROW(MediaBadUrlException(url, "Invalid ssl_capath path"));
         else
             s.setCertificateAuthoritiesPath(ca_path);
     }
 
-    param = url.getQueryParam( "proxy" );
-    if ( ! param.empty() )
+    string proxy = url.getQueryParam( "proxy" );
+    if ( ! proxy.empty() )
     {
-        if ( param == EXPLICITLY_NO_PROXY ) {
-	    // Workaround TransferSettings shortcoming: With an
-	    // empty proxy string, code will continue to look for
-	    // valid proxy settings. So set proxy to some non-empty
-	    // string, to indicate it has been explicitly disabled.
-	    s.setProxy(EXPLICITLY_NO_PROXY);
+        if ( proxy == "_none_" ) {
             s.setProxyEnabled(false);
         }
         else {
             string proxyport( url.getQueryParam( "proxyport" ) );
             if ( ! proxyport.empty() ) {
-                param += ":" + proxyport;
+                proxy += ":" + proxyport;
             }
-            s.setProxy(param);
+            s.setProxy(proxy);
             s.setProxyEnabled(true);
         }
     }
 
-    param = url.getQueryParam( "proxyuser" );
-    if ( ! param.empty() )
-    {
-      s.setProxyUsername(param);
-      s.setProxyPassword(url.getQueryParam( "proxypass" ));
-    }
-
     // HTTP authentication type
-    param = url.getQueryParam("auth");
-    if (!param.empty() && (url.getScheme() == "http" || url.getScheme() == "https"))
+    string use_auth = url.getQueryParam("auth");
+    if (!use_auth.empty() && (url.getScheme() == "http" || url.getScheme() == "https"))
     {
         try
         {
-	    CurlAuthData::auth_type_str2long(param);	// check if we know it
+	    CurlAuthData::auth_type_str2long(use_auth);	// check if we know it
         }
         catch (MediaException & ex_r)
 	{
 	    DBG << "Rethrowing as MediaUnauthorizedException.";
 	    ZYPP_THROW(MediaUnauthorizedException(url, ex_r.msg(), "", ""));
 	}
-        s.setAuthType(param);
+        s.setAuthType(use_auth);
     }
 
     // workarounds
-    param = url.getQueryParam("head_requests");
-    if( !param.empty() && param == "no" )
+    std::string head_requests( url.getQueryParam("head_requests"));
+    if( !head_requests.empty() && head_requests == "no")
         s.setHeadRequestsAllowed(false);
 }
 
@@ -341,24 +328,10 @@ void fillSettingsFromUrl( const Url &url, TransferSettings &s )
  */
 void fillSettingsSystemProxy( const Url&url, TransferSettings &s )
 {
-    ProxyInfo proxy_info;
-    if ( proxy_info.useProxyFor( url ) )
-    {
-      // We must extract any 'user:pass' from the proxy url
-      // otherwise they won't make it into curl (.curlrc wins).
-      try {
-	Url u( proxy_info.proxy( url ) );
-	s.setProxy( u.asString( url::ViewOption::WITH_SCHEME + url::ViewOption::WITH_HOST + url::ViewOption::WITH_PORT ) );
-	// don't overwrite explicit auth settings
-	if ( s.proxyUsername().empty() )
-	{
-	  s.setProxyUsername( u.getUsername( url::E_ENCODED ) );
-	  s.setProxyPassword( u.getPassword( url::E_ENCODED ) );
-	}
-	s.setProxyEnabled( true );
-      }
-      catch (...) {}	// no proxy if URL is malformed
-    }
+    ProxyInfo proxy_info (ProxyInfo::ImplPtr(new ProxyInfoSysconfig("proxy")));
+    s.setProxyEnabled( proxy_info.useProxyFor( url ) );
+    if ( s.proxyEnabled() )
+      s.setProxy(proxy_info.proxy(url.getScheme()));
 }
 
 Pathname MediaCurl::_cookieFile = "/var/lib/YaST2/cookies";
@@ -470,28 +443,6 @@ MediaCurl::MediaCurl( const Url &      url_r,
   }
 }
 
-Url MediaCurl::clearQueryString(const Url &url) const
-{
-  Url curlUrl (url);
-  curlUrl.setUsername( "" );
-  curlUrl.setPassword( "" );
-  curlUrl.setPathParams( "" );
-  curlUrl.setFragment( "" );
-  curlUrl.delQueryParam("cookies");
-  curlUrl.delQueryParam("proxy");
-  curlUrl.delQueryParam("proxyport");
-  curlUrl.delQueryParam("proxyuser");
-  curlUrl.delQueryParam("proxypass");
-  curlUrl.delQueryParam("ssl_capath");
-  curlUrl.delQueryParam("ssl_verify");
-  curlUrl.delQueryParam("timeout");
-  curlUrl.delQueryParam("auth");
-  curlUrl.delQueryParam("username");
-  curlUrl.delQueryParam("password");
-  curlUrl.delQueryParam("mediahandler");
-  return curlUrl;
-}
-
 TransferSettings & MediaCurl::settings()
 {
     return _settings;
@@ -576,12 +527,15 @@ void MediaCurl::setupEasy()
       disconnectFrom();
       ZYPP_RETHROW(e);
   }
-  // if the proxy was not set (or explicitly unset) by url, then look...
+
+  // if the proxy was not set by url, then look
   if ( _settings.proxy().empty() )
   {
-      // ...at the system proxy settings
+      // at the system proxy settings
       fillSettingsSystemProxy(_url, _settings);
   }
+
+  DBG << "Proxy: " << (_settings.proxy().empty() ? "-none-" : _settings.proxy()) << endl;
 
  /**
   * Connect timeout
@@ -635,55 +589,43 @@ void MediaCurl::setupEasy()
     }
   }
 
-  if ( _settings.proxyEnabled() && ! _settings.proxy().empty() )
+  if ( _settings.proxyEnabled() )
   {
-    DBG << "Proxy: '" << _settings.proxy() << "'" << endl;
-    SET_OPTION(CURLOPT_PROXY, _settings.proxy().c_str());
-    SET_OPTION(CURLOPT_PROXYAUTH, CURLAUTH_BASIC|CURLAUTH_DIGEST|CURLAUTH_NTLM );
-    /*---------------------------------------------------------------*
-     *    CURLOPT_PROXYUSERPWD: [user name]:[password]
-     *
-     * Url::option(proxyuser and proxypassword) -> CURLOPT_PROXYUSERPWD
-     *  If not provided, $HOME/.curlrc is evaluated
-     *---------------------------------------------------------------*/
-
-    string proxyuserpwd = _settings.proxyUserPassword();
-
-    if ( proxyuserpwd.empty() )
+    if ( ! _settings.proxy().empty() )
     {
-      CurlConfig curlconf;
-      CurlConfig::parseConfig(curlconf); // parse ~/.curlrc
-      if ( curlconf.proxyuserpwd.empty() )
-	DBG << "Proxy: ~/.curlrc does not contain the proxy-user option" << endl;
-      else
+      SET_OPTION(CURLOPT_PROXY, _settings.proxy().c_str());
+      /*---------------------------------------------------------------*
+        CURLOPT_PROXYUSERPWD: [user name]:[password]
+
+        Url::option(proxyuser and proxypassword) -> CURLOPT_PROXYUSERPWD
+        If not provided, $HOME/.curlrc is evaluated
+        *---------------------------------------------------------------*/
+
+      string proxyuserpwd = _settings.proxyUserPassword();
+
+      if ( proxyuserpwd.empty() )
       {
-	proxyuserpwd = curlconf.proxyuserpwd;
-	DBG << "Proxy: using proxy-user from ~/.curlrc" << endl;
+        CurlConfig curlconf;
+        CurlConfig::parseConfig(curlconf); // parse ~/.curlrc
+        if (curlconf.proxyuserpwd.empty())
+          DBG << "~/.curlrc does not contain the proxy-user option" << endl;
+        else
+        {
+          proxyuserpwd = curlconf.proxyuserpwd;
+          DBG << "using proxy-user from ~/.curlrc" << endl;
+        }
       }
-    }
-    else
-    {
-      DBG << "Proxy: using provided proxy-user '" << _settings.proxyUsername() << "'" << endl;
-    }
 
-    if ( ! proxyuserpwd.empty() )
-    {
-      SET_OPTION(CURLOPT_PROXYUSERPWD, unEscape( proxyuserpwd ).c_str());
+      proxyuserpwd = unEscape( proxyuserpwd );
+      if ( ! proxyuserpwd.empty() )
+        SET_OPTION(CURLOPT_PROXYUSERPWD, proxyuserpwd.c_str());
     }
   }
-#if CURLVERSION_AT_LEAST(7,19,4)
-  else if ( _settings.proxy() == EXPLICITLY_NO_PROXY )
-  {
-    // Explicitly disabled in URL (see fillSettingsFromUrl()).
-    // This should also prevent libcurl from looking into the environment.
-    DBG << "Proxy: explicitly NOPROXY" << endl;
-    SET_OPTION(CURLOPT_NOPROXY, "*");
-  }
-#endif
   else
   {
-    // libcurl may look into the enviroanment
-    DBG << "Proxy: not explicitly set" << endl;
+#if CURLVERSION_AT_LEAST(7,19,4)
+      SET_OPTION(CURLOPT_NOPROXY, "*");
+#endif
   }
 
   /** Speed limits */
@@ -1009,11 +951,9 @@ void MediaCurl::evaluateCurlCode( const Pathname &filename,
         err = "Write error";
         break;
       case CURLE_PARTIAL_FILE:
-      case CURLE_OPERATION_TIMEDOUT:
-	timeout_reached	= true; // fall though to TimeoutException
-	// fall though...
       case CURLE_ABORTED_BY_CALLBACK:
-         if( timeout_reached )
+      case CURLE_OPERATION_TIMEDOUT:
+        if( timeout_reached)
         {
           err  = "Timeout reached";
           ZYPP_THROW(MediaTimeoutException(url));
@@ -1062,7 +1002,14 @@ bool MediaCurl::doGetDoesFileExist( const Pathname & filename ) const
     // (some proxies dislike them in the URL).
     // Curl seems to need the just scheme, hostname and a path;
     // the rest was already passed as curl options (in attachTo).
-  Url curlUrl( clearQueryString(url) );
+  Url curlUrl( url );
+
+  // Use asString + url::ViewOptions instead?
+  curlUrl.setUsername( "" );
+  curlUrl.setPassword( "" );
+  curlUrl.setPathParams( "" );
+  curlUrl.setQueryString( "" );
+  curlUrl.setFragment( "" );
 
   //
     // See also Bug #154197 and ftp url definition in RFC 1738:
@@ -1366,7 +1313,14 @@ void MediaCurl::doGetFileCopyFile( const Pathname & filename , const Pathname & 
     // (some proxies dislike them in the URL).
     // Curl seems to need the just scheme, hostname and a path;
     // the rest was already passed as curl options (in attachTo).
-    Url curlUrl( clearQueryString(url) );
+    Url curlUrl( url );
+
+    // Use asString + url::ViewOptions instead?
+    curlUrl.setUsername( "" );
+    curlUrl.setPassword( "" );
+    curlUrl.setPathParams( "" );
+    curlUrl.setQueryString( "" );
+    curlUrl.setFragment( "" );
 
     //
     // See also Bug #154197 and ftp url definition in RFC 1738:
@@ -1397,27 +1351,6 @@ void MediaCurl::doGetFileCopyFile( const Pathname & filename , const Pathname & 
     }
 
     ret = curl_easy_perform( _curl );
-#if CURLVERSION_AT_LEAST(7,19,4)
-    // bnc#692260: If the client sends a request with an If-Modified-Since header
-    // with a future date for the server, the server may respond 200 sending a
-    // zero size file.
-    // curl-7.19.4 introduces CURLINFO_CONDITION_UNMET to check this condition.
-    if ( ftell(file) == 0 && ret == 0 )
-    {
-      long httpReturnCode = 33;
-      if ( curl_easy_getinfo( _curl, CURLINFO_RESPONSE_CODE, &httpReturnCode ) == CURLE_OK && httpReturnCode == 200 )
-      {
-	long conditionUnmet = 33;
-	if ( curl_easy_getinfo( _curl, CURLINFO_CONDITION_UNMET, &conditionUnmet ) == CURLE_OK && conditionUnmet )
-	{
-	  WAR << "TIMECONDITION unmet - retry without." << endl;
-	  curl_easy_setopt(_curl, CURLOPT_TIMECONDITION, CURL_TIMECOND_NONE);
-	  curl_easy_setopt(_curl, CURLOPT_TIMEVALUE, 0L);
-	  ret = curl_easy_perform( _curl );
-	}
-      }
-    }
-#endif
 
     if ( curl_easy_setopt( _curl, CURLOPT_PROGRESSDATA, NULL ) != 0 ) {
       WAR << "Can't unset CURLOPT_PROGRESSDATA: " << _curlError << endl;;
